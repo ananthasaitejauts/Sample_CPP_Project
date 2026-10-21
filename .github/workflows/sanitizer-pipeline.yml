@@ -1,1 +1,96 @@
+name: Dynamic Analysis & Verification Pipeline
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  run-sanitizers-and-verification:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Install Analysis Tools & Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            g++ \
+            clang \
+            clang-tidy \
+            clang-tools \
+            cppcheck \
+            valgrind \
+            gdb \
+            libclang-rt-18-dev \
+            python3 \
+            python3-pandas \
+            zip
+
+      - name: Prepare Workspace & Environment
+        run: |
+          rm -rf logs bin
+          mkdir -p logs bin
+          : > logs/commands.tsv
+
+      - name: Build Instrumented & Clean Binaries
+        run: |
+          g++ -std=c++17 -O0 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined,float-cast-overflow \
+            -fsanitize-recover=address,undefined -pthread \
+            sanitize_v3_fixed.cpp -o bin/gcc_asan_ubsan > logs/build_gcc_asan_ubsan.log 2>&1 || true
+
+          clang++ -std=c++17 -O0 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined,float-cast-overflow,implicit-conversion \
+            -fsanitize-recover=all -pthread \
+            sanitize_v3_fixed.cpp -o bin/clang_asan_ubsan > logs/build_clang_asan_ubsan.log 2>&1 || true
+
+          g++ -std=c++17 -O0 -g -fsanitize=thread -pthread \
+            sanitize_v3_fixed.cpp -o bin/gcc_tsan > logs/build_gcc_tsan.log 2>&1 || true
+
+          g++ -std=c++17 -O0 -g -pthread \
+            sanitize_v3_fixed.cpp -o bin/plain > logs/build_plain.log 2>&1 || true
+
+          g++ -std=c++17 -O2 -Wall -Wextra -c sanitize_v3_fixed.cpp -o /dev/null > logs/gcc_O2_warnings.log 2>&1 || true
+          clang++ -std=c++17 -O2 -Wall -Wextra -c sanitize_v3_fixed.cpp -o /dev/null > logs/clang_O2_warnings.log 2>&1 || true
+
+      - name: Execute Dynamic Runs
+        env:
+          ASAN_OPTIONS: "halt_on_error=0:detect_leaks=1:alloc_dealloc_mismatch=1:print_summary=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=0:report_error_type=1"
+          TSAN_OPTIONS: "halt_on_error=0"
+        run: |
+          ./bin/gcc_asan_ubsan > logs/run_gcc_asan_ubsan.log 2>&1 || true
+          ./bin/clang_asan_ubsan > logs/run_clang_asan_ubsan.log 2>&1 || true
+          ./bin/gcc_tsan tsan > logs/run_gcc_tsan.log 2>&1 || true
+          valgrind --leak-check=full --show-leak-kinds=definite --track-origins=yes ./bin/plain > logs/run_valgrind_memcheck.log 2>&1 || true
+          valgrind --tool=helgrind ./bin/plain tsan > logs/run_valgrind_helgrind.log 2>&1 || true
+          valgrind --tool=drd ./bin/plain tsan > logs/run_valgrind_drd.log 2>&1 || true
+
+      - name: Run Static Analysis
+        run: |
+          cppcheck --enable=all --inconclusive --std=c++17 --suppress=missingIncludeSystem \
+            --template='{file}:{line}:{column}: {severity}: {message} [{id}]' \
+            sanitize_v3_fixed.cpp > logs/cppcheck.log 2>&1 || true
+
+          clang-tidy -checks='-*,bugprone-*,clang-analyzer-*,cert-*,cppcoreguidelines-*,misc-*,performance-*' \
+            sanitize_v3_fixed.cpp -- -std=c++17 > logs/clang_tidy.log 2>&1 || true
+
+      - name: Generate & Verify CSV Reports
+        run: |
+          python3 -I build_report.py sanitize_v3_fixed.cpp sanitize_v3_fixed_validation_report.csv
+          python3 -I verify_report.py sanitize_v3_fixed_validation_report.csv sanitize_v3_fixed.cpp > logs/verification.txt || true
+
+      - name: Package Tool Logs & CSV Artifacts
+        run: |
+          zip -qr sanitize_fixed_reports.zip logs sanitize_v3_fixed_validation_report.csv
+
+      - name: Upload Report Bundle to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sanitizer-Verification-Reports
+          path: sanitize_fixed_reports.zip
